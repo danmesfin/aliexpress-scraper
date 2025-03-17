@@ -1,5 +1,4 @@
 import json
-import math
 import random
 import asyncio
 from typing import Dict, List, Optional
@@ -7,8 +6,6 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 import logging
-import re
-import time
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -255,6 +252,8 @@ async def scrape_search(url: str, max_pages: int = 1) -> List[Dict]:
     
     return products
 
+# Test function
+# Run this function to test the scraper
 async def run():
     """Test function"""
     try:
