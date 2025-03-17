@@ -23,7 +23,7 @@ Search for products on AliExpress.
 **Request Body:**
 ```json
 {
-    "url": "https://aliexpress.com/...",  // AliExpress search URL
+    "url": "https://www.aliexpress.com/w/wholesale-iphone-12.html?g=y&SearchText=iphone+12",  // AliExpress search URL
     "max_pages": 1                        // Number of pages to scrape (default: 1, max: 10)
 }
 ```
