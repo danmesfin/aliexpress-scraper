@@ -1,18 +1,21 @@
 import json
 import random
 import asyncio
+import math
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import httpx
-from bs4 import BeautifulSoup
+from parsel import Selector
 import logging
 
-# Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 def get_headers() -> Dict[str, str]:
-    """Get request headers with random user agent"""
+    """
+    Generate request headers with a random user agent to prevent blocking.
+    Includes necessary cookies and headers for AliExpress requests.
+    """
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -35,237 +38,143 @@ def get_headers() -> Dict[str, str]:
         "Cookie": "aep_usuc_f=site=glo&c_tp=USD&region=US&b_locale=en_US"
     }
 
-async def fetch_with_retry(client: httpx.AsyncClient, url: str, max_retries: int = 3) -> Optional[str]:
-    """Fetch URL content with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            logger.debug(f"Attempting to fetch URL: {url} (attempt {attempt + 1}/{max_retries})")
-            
-            # Add random delay between attempts
-            if attempt > 0:
-                delay = random.uniform(2 ** attempt, 2 ** (attempt + 1))
-                logger.debug(f"Waiting {delay:.2f} seconds before retry")
-                await asyncio.sleep(delay)
-            
-            response = await client.get(
-                url,
-                headers=get_headers(),
-                follow_redirects=True,
-                timeout=httpx.Timeout(30.0, connect=10.0, read=20.0, write=20.0)
-            )
-            response.raise_for_status()
-            
-            # Log response info
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response headers: {dict(response.headers)}")
-            
-            content = response.text
-            logger.debug(f"Response content length: {len(content)} characters")
-            
-            # Save response to file for debugging
-            with open("last_response.html", "w", encoding="utf-8") as f:
-                f.write(content)
-            logger.debug("Saved response content to last_response.html")
-            
-            return content
-            
-        except httpx.TimeoutException as e:
-            logger.warning(f"Timeout on attempt {attempt + 1}: {str(e)}")
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"HTTP error {e.response.status_code} on attempt {attempt + 1}")
-        except httpx.RequestError as e:
-            logger.warning(f"Request error on attempt {attempt + 1}: {str(e)}")
-        except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
-        
-        if attempt == max_retries - 1:
-            logger.error(f"All {max_retries} attempts failed for URL: {url}")
-            raise
+def extract_search(response) -> Dict:
+    """
+    Extract product data from AliExpress search page response.
+    The data is stored in a JavaScript variable '_init_data_' within a script tag.
     
-    return None
-
-def extract_search_data(html: str) -> Dict:
-    """Extract product data from search page HTML"""
+    Returns:
+        Dict containing the parsed product data or empty product list if extraction fails
+    """
     try:
-        soup = BeautifulSoup(html, 'html.parser')
-        logger.debug("Created BeautifulSoup object")
-        
-        # Look for product cards in the new layout
-        products = []
-        product_cards = soup.select('div.search-item-card-wrapper-gallery')
-        
-        if product_cards:
-            logger.debug(f"Found {len(product_cards)} product cards")
+        sel = Selector(response.text)
+        script_with_data = sel.xpath('//script[contains(.,"_init_data_=")]')
+        if not script_with_data:
+            logger.error("No _init_data_ script found in page")
+            return {"data": {"root": {"fields": {"mods": {"itemList": {"content": []}}}}}}
             
-            for card in product_cards:
-                try:
-                    # Find the product link
-                    link = card.select_one('a.search-card-item')
-                    if not link:
-                        continue
-                        
-                    # Extract product ID from URL
-                    product_id = link.get('href', '').split('item/')[-1].split('.html')[0]
-                    
-                    # Extract product title
-                    title_elem = card.select_one('h3.lq_jl')
-                    title = title_elem.text.strip() if title_elem else None
-                    
-                    # Extract price
-                    price_spans = card.select('div.lq_j3 span')
-                    price = ''
-                    for span in price_spans:
-                        price += span.text.strip()
-                    price = price.replace('$', '')
-                    
-                    # Extract image URL
-                    img = card.select_one('img.l9_be')
-                    image_url = img.get('src') if img else None
-                    
-                    # Extract store name
-                    store_elem = card.select_one('span.io_ip')
-                    store_name = store_elem.text.strip() if store_elem else None
-                    
-                    # Extract sales count
-                    sales_elem = card.select_one('span.lq_jg')
-                    sales = sales_elem.text.strip() if sales_elem else None
-                    
-                    product_data = {
-                        "productId": product_id,
-                        "title": title,
-                        "price": price,
-                        "image": image_url,
-                        "store": store_name,
-                        "sales": sales,
-                        "url": f"https://www.aliexpress.com/item/{product_id}.html"
-                    }
-                    
-                    if product_data["productId"] and product_data["title"]:
-                        products.append(product_data)
-                        logger.debug(f"Extracted product: {product_data}")
-                        
-                except Exception as e:
-                    logger.error(f"Error parsing product card: {str(e)}")
-            
-            logger.debug(f"Successfully extracted {len(products)} products")
-            return {"mods": {"itemList": {"content": products}}}
-            
-        logger.warning("Could not find any product cards")
-        return {"mods": {"itemList": {"content": []}}}
-        
+        data = json.loads(script_with_data.re(r'_init_data_\s*=\s*{\s*data:\s*({.+}) }')[0])
+        return data['data']['root']['fields']
     except Exception as e:
-        logger.error(f"Error extracting search data: {str(e)}")
+        logger.error(f"Error in extract_search: {str(e)}")
         return {"mods": {"itemList": {"content": []}}}
 
-def parse_product(data: Dict) -> Optional[Dict]:
-    """Parse individual product data"""
+def parse_search(response):
+    """
+    Parse AliExpress search results into a standardized format.
+    Extracts key product information including ID, title, price, and store details.
+    
+    Returns:
+        List of parsed product dictionaries with normalized data
+    """
     try:
-        product = {
-            "id": data.get("productId"),
-            "title": data.get("title"),
-            "price": float(data.get("price", "0").replace(",", "")),
-            "currency": "USD",
-            "url": data.get("url"),
-            "image": data.get("image"),
-            "store": data.get("store"),
-            "sales": data.get("sales")
-        }
+        data = extract_search(response)
+        parsed = []
         
-        # Clean up the data
-        if product["image"] and not product["image"].startswith(("http:", "https:")):
-            product["image"] = f"https:{product['image']}"
+        if not data.get("mods", {}).get("itemList", {}).get("content"):
+            logger.info("No products found in search results")
+            return []
             
-        logger.debug(f"Parsed product: {product}")
-        return product
+        for result in data["mods"]["itemList"]["content"]:
+            try:
+                parsed.append({
+                    "id": result["productId"],
+                    "url": f"https://www.aliexpress.com/item/{result['productId']}.html",
+                    "type": result.get("productType", "natural"),
+                    "title": result["title"]["displayTitle"],
+                    "price": result["prices"]["salePrice"]["minPrice"],
+                    "currency": result["prices"]["salePrice"]["currencyCode"],
+                    "trade": result.get("trade", {}).get("tradeDesc"),
+                    "thumbnail": result["image"]["imgUrl"].lstrip("/"),
+                    "store": {
+                        "url": result["store"]["storeUrl"],
+                        "name": result["store"]["storeName"],
+                        "id": str(result["store"]["storeId"]),
+                        "ali_id": str(result["store"]["aliMemberId"]),
+                    },
+                })
+            except KeyError as e:
+                logger.warning(f"Missing required field in product data: {str(e)}")
+                continue
+                
+        return parsed
     except Exception as e:
-        logger.error(f"Error parsing product: {str(e)}")
-        return None
+        logger.error(f"Error in parse_search: {str(e)}")
+        return []
 
-def add_or_replace_url_parameters(url: str, **params) -> str:
-    """Add or replace URL parameters"""
+async def scrape_search(url: str, max_pages: int = 1) -> Dict:
+    """
+    Scrape AliExpress search results using their modern API format.
+    Handles both old-style URLs (?SearchText=query) and new-style URLs (/wholesale-query.html).
+    
+    Args:
+        url: AliExpress search URL
+        max_pages: Maximum number of pages to scrape (default: 1)
+    
+    Returns:
+        Dict containing:
+        - products: List of parsed product data
+        - total: Total number of products found
+        - error: Error message if scraping failed (optional)
+    """
     try:
+        # Extract and normalize search query from URL
         parsed_url = urlparse(url)
         query_params = dict(parse_qsl(parsed_url.query))
-        query_params.update(params)
-        return urlunparse(parsed_url._replace(query=urlencode(query_params)))
-    except Exception as e:
-        logger.error(f"Error modifying URL parameters: {str(e)}")
-        return url
-
-async def scrape_search(url: str, max_pages: int = 1) -> List[Dict]:
-    """Scrape AliExpress search results"""
-    logger.info(f"Starting search scrape for URL: {url}")
-    products = []
-    
-    try:
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        timeout = httpx.Timeout(30.0, connect=10.0)
+        query = query_params.get('SearchText', '').strip()
         
-        async with httpx.AsyncClient(
-            limits=limits,
-            timeout=timeout,
-            verify=True,
-            http2=True
-        ) as client:
+        if not query and 'wholesale-' in parsed_url.path:
+            query = parsed_url.path.split('wholesale-')[-1].split('.html')[0].replace('-', ' ')
+        
+        if not query:
+            logger.error("Empty search query")
+            return {"products": [], "total": 0, "error": "Search query cannot be empty"}
+            
+        query = query.replace(" ", "-")
+        sort_type = query_params.get('SortType', query_params.get('sorttype', 'default'))
+
+        async with httpx.AsyncClient(follow_redirects=True) as session:
+            session.headers.update(get_headers())
+            
             # Fetch first page
-            html = await fetch_with_retry(client, url)
-            if not html:
-                return []
-                
-            data = extract_search_data(html)
-            product_list = data.get("mods", {}).get("itemList", {}).get("content", [])
+            logger.info(f"Scraping search query: {query} with sort: {sort_type}")
+            first_page = await session.get(
+                f"https://www.aliexpress.com/w/wholesale-{query}.html"
+                f"?sorttype={sort_type}&d=y&page=1"
+            )
             
-            logger.debug(f"Raw product list: {json.dumps(product_list[:1], indent=2)}")
-            
-            for product in product_list:
-                parsed_product = parse_product(product)
-                if parsed_product:
-                    products.append(parsed_product)
-            
-            logger.info(f"Found {len(products)} products on first page")
-            
-            # Handle pagination if needed
+            product_previews = parse_search(first_page)
+            if not product_previews:
+                logger.info("No products found on first page")
+                return {"products": [], "total": 0}
+
+            # Fetch additional pages if requested
             if max_pages > 1:
-                for page in range(2, max_pages + 1):
-                    try:
-                        page_url = add_or_replace_url_parameters(url, page=page)
-                        page_html = await fetch_with_retry(client, page_url)
-                        if page_html:
-                            page_data = extract_search_data(page_html)
-                            page_products = page_data.get("mods", {}).get("itemList", {}).get("content", [])
-                            
-                            for product in page_products:
-                                parsed_product = parse_product(product)
-                                if parsed_product:
-                                    products.append(parsed_product)
-                            
-                            logger.info(f"Added {len(page_products)} products from page {page}")
-                    except Exception as e:
-                        logger.error(f"Error fetching page {page}: {str(e)}")
-                        continue
-                    
-                    # Add delay between pages
-                    await asyncio.sleep(random.uniform(2, 4))
-    
+                try:
+                    async def scrape_page(page):
+                        return await session.get(
+                            f"https://www.aliexpress.com/w/wholesale-{query}.html"
+                            f"?sorttype={sort_type}&d=y&page={page}"
+                        )
+
+                    other_pages = await asyncio.gather(*[scrape_page(i) for i in range(2, max_pages + 1)])
+                    for response in other_pages:
+                        product_previews.extend(parse_search(response))
+                except Exception as e:
+                    logger.error(f"Error scraping additional pages: {str(e)}")
+
+            return {"products": product_previews, "total": len(product_previews)}
+
     except Exception as e:
         logger.error(f"Error in scrape_search: {str(e)}")
-    
-    return products
+        return {"products": [], "total": 0, "error": str(e)}
 
-# Test function
-# Run this function to test the scraper
 async def run():
-    """Test function"""
-    try:
-        url = "https://www.aliexpress.com/w/wholesale-iphone-12.html?g=y&SearchText=iphone+12"
-        logger.info(f"Starting test run with URL: {url}")
-        
-        data = await scrape_search(url, max_pages=1)
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-        
-        logger.info(f"Test run completed. Found {len(data)} products")
-    except Exception as e:
-        logger.error(f"Error in test run: {str(e)}")
+    """Test the scraper with a sample search query"""
+    url = "https://www.aliexpress.com/w/wholesale-smartphone.html"
+    results = await scrape_search(url, max_pages=1)
+    print(f"Found {results['total']} products")
+    print(json.dumps(results['products'][:2], indent=2))
 
 if __name__ == "__main__":
     asyncio.run(run())
